@@ -1,0 +1,10 @@
+torch>=2.0.0
+torchvision
+torchaudio
+timm>=0.9.0
+pandas
+scikit-learn
+Pillow
+opencv-python
+tqdm
+# xformers # 可选, 如果你的模型和硬件支持，并且希望手动集成更底层的优化 (PyTorch 2.0+的SDPA通常是首选)
