@@ -45,7 +45,7 @@ danbooru_tagger/
    pip install -r requirements.txt
    ```
 
-**二、 数据准备**
+**二、 数据准备(你可以直接运行data_prepare.py来从danbooru2024数据集获取)**
 
 1. **图像和标签文件:**
    * 在项目根目录下创建 `data/images/` 文件夹
