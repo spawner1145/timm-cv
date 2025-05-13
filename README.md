@@ -47,6 +47,8 @@ danbooru_tagger/
 
 **二、 数据准备(你可以直接运行data_prepare.py来从danbooru2024数据集获取)**
 
+> 注意:如果你希望使用data_prepare.py，先去[danbooru2024数据集](https://huggingface.co/datasets/deepghs/danbooru2024-webp-4Mpixel)下载[metadata.parquet](https://huggingface.co/datasets/deepghs/danbooru2024-webp-4Mpixel/blob/main/metadata.parquet)并把它放到根目录
+
 1. **图像和标签文件:**
    * 在项目根目录下创建 `data/images/` 文件夹
    * 将你所有的训练图片放入 `data/images/` 文件夹中
