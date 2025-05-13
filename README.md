@@ -39,7 +39,7 @@ pip install -r requirements.txt
 
 > 注意:如果你希望使用data_prepare.py，先去[danbooru2024数据集](https://huggingface.co/datasets/deepghs/danbooru2024-webp-4Mpixel)下载[metadata.parquet](https://huggingface.co/datasets/deepghs/danbooru2024-webp-4Mpixel/blob/main/metadata.parquet)并把它放到根目录
 
-1. **图像和标签文件:**
+1. **图像和标签文件:(如果你用data_prepare.py，数据准备这些可以跳过了)**
    * 在项目根目录下创建 `data/images/` 文件夹
    * 将你所有的训练图片放入 `data/images/` 文件夹中
    * 对于每一张图片 (例如 `image1.jpg`)，在**相同目录下**创建一个同名的 `.txt` 文件 (例如 `image1.txt`)
