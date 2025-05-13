@@ -7,40 +7,35 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 import logging
-import random # 仍然保留 random 用于其他可能的随机操作或作为备选
+import random
 import numpy as np
-from sklearn.model_selection import train_test_split # 用于单标签或简单场景的备选
 from tqdm import tqdm
+
 try:
     from skmultilearn.model_selection import IterativeStratification
     SKMULTILEARN_AVAILABLE = True
 except ImportError:
     SKMULTILEARN_AVAILABLE = False
-    logging.warning("scikit-multilearn 未安装或导入失败。多标签分层划分将不可用，将回退到随机划分。请运行: pip install scikit-multilearn")
+    # logging.warning 在 main_worker 中由 rank 0 记录
 
-# 获取一个logger实例
 logger = logging.getLogger(__name__)
+
+# --- 平衡采样策略的硬编码配置 ---
+ENABLE_BALANCED_SAMPLING_TRAIN_HARDCODED = True 
+MAX_SAMPLES_PER_CLASS_BALANCED_HARDCODED = 1000  
+TARGET_TRAIN_SET_SIZE_BALANCED_HARDCODED = -1 
+BALANCED_SAMPLING_SEED = 42
+# ------------------------------------
 
 class DanbooruDataset(Dataset):
     def __init__(self, config, mode="train", tags_list=None, tag_to_idx=None, rank=0, world_size=1):
-        """
-        初始化数据集
-        Args:
-            config: 配置对象
-            mode: "train", "val", "test"
-            tags_list: 预定义的标签列表 (可选)
-            tag_to_idx: 预定义的标签到索引的映射 (可选)
-            rank: 当前进程的 rank
-            world_size: 总进程数
-        """
         self.config = config
         self.mode = mode.lower()
         self.image_dir = config.IMAGE_DIR
         self.rank = rank
         self.world_size = world_size
+        self.file_pairs = [] 
 
-        # 1. 构建或使用已有的标签词汇表 (所有进程都应有相同的词汇表)
-        # 这一步需要先于数据加载和划分，因为我们需要基于最终的词汇表来创建标签向量
         if tags_list is None or tag_to_idx is None: 
             self.tags_list, self.tag_to_idx = self._build_vocab_from_selected_tags()
             if self.config.NUM_CLASSES == -1 or self.config.NUM_CLASSES != len(self.tags_list):
@@ -50,169 +45,277 @@ class DanbooruDataset(Dataset):
             self.tags_list = tags_list
             self.tag_to_idx = tag_to_idx
             if self.config.NUM_CLASSES != len(self.tags_list):
-                if self.rank == 0: logger.warning(f"配置中的 NUM_CLASSES ({self.config.NUM_CLASSES}) 与提供的词汇表大小 ({len(self.tags_list)}) 不匹配，将使用词汇表大小")
+                if self.rank == 0: logger.warning(f"配置中的 NUM_CLASSES ({self.config.NUM_CLASSES}) 与提供的词汇表大小 ({len(self.tags_list)}) 不匹配")
                 self.config.NUM_CLASSES = len(self.tags_list)
         
         if self.config.NUM_CLASSES == 0:
-            if self.rank == 0: logger.warning("警告: 最终词汇表为空 (NUM_CLASSES = 0)，请检查 selected_tags.csv 和过滤条件")
-            # 如果词汇表为空，后续处理会出问题，可以提前抛出错误或返回空数据集
-            self.current_mode_file_pairs = []
-            self.transform = self._get_transform() # 即使为空也定义transform
-            return
-
-
-        # 2. 查找所有图像文件及其对应的 .txt 标签文件
-        all_file_paths = self._find_image_paths() # 只获取图像路径列表
-
-        if not all_file_paths:
-            if self.rank == 0: 
-                logger.warning(f"在目录 {self.image_dir} 中没有找到图像文件 (支持的图像扩展名: {config.IMAGE_EXTENSIONS})")
-            self.current_mode_file_pairs = []
+            if self.rank == 0: logger.warning("警告: 最终词汇表为空 (NUM_CLASSES = 0)")
             self.transform = self._get_transform()
             return
-            
-        # 3. 为所有图像创建标签向量 (multi-hot encoding) 以用于分层划分
-        # 这一步可能会比较耗时，因为它需要读取所有图像的 .txt 文件
-        # 只有在 mode 不是 "test" 且 skmultilearn 可用时才进行分层划分的准备
-        # "test" 模式通常使用所有数据，不需要划分
-        
-        X_filepaths = [] # 存储有效的文件路径 (图像和对应txt都存在)
-        y_labels_list = [] # 存储对应的多标签向量列表
 
-        if self.mode != "test": # 测试集通常不参与划分，或者有单独的测试集文件列表
-            if self.rank == 0: logger.info("正在为所有图像准备标签向量以进行数据划分...")
-            temp_progress_bar = tqdm(all_file_paths, desc="读取标签文件", disable=(self.rank != 0))
-            for img_path in temp_progress_bar:
-                base_filename, _ = os.path.splitext(img_path)
-                txt_path = base_filename + ".txt"
-                if os.path.exists(txt_path):
+        all_image_paths = self._find_image_paths()
+        if not all_image_paths:
+            if self.rank == 0: logger.warning(f"在目录 {self.image_dir} 中没有找到图像文件")
+            self.transform = self._get_transform()
+            return
+        
+        use_balanced_sampling_for_train = ENABLE_BALANCED_SAMPLING_TRAIN_HARDCODED
+
+        if self.mode == "train" and use_balanced_sampling_for_train:
+            if self.rank == 0: logger.info("为训练集启用平衡采样策略...")
+            # 所有 rank 都需要构建这个映射，以确保后续采样逻辑一致
+            tag_idx_to_img_paths, img_path_to_txt_path_map = self._build_tag_to_image_map(all_image_paths)
+            if not tag_idx_to_img_paths and not img_path_to_txt_path_map :
+                 if self.rank == 0: logger.error("平衡采样预处理失败或未找到有效数据，训练集将为空。")
+            else:
+                self._apply_balanced_sampling(tag_idx_to_img_paths, img_path_to_txt_path_map)
+        else: 
+            if self.rank == 0: logger.info(f"为模式 '{self.mode}' 应用标准划分策略 (分层或随机)...")
+            # 标准划分也需要在所有rank上执行相同的逻辑，以确保数据集一致
+            self._apply_standard_splitting(all_image_paths)
+        
+        if self.rank == 0: 
+            logger.info(f"模式: {self.mode}, 最终样本数量 (rank {self.rank} 在 DDP Sampler 前): {len(self.file_pairs)}")
+            if len(self.file_pairs) == 0 and self.mode != "test":
+                 logger.error(f"警告: 模式 '{self.mode}' 数据集为空 (rank {self.rank})，请检查配置和数据源！")
+        
+        self.transform = self._get_transform()
+
+    def _build_tag_to_image_map(self, all_image_paths):
+        tag_idx_to_img_paths = [[] for _ in range(self.config.NUM_CLASSES)]
+        img_path_to_txt_path = {}
+        valid_image_paths_count = 0
+        
+        prog_desc = "构建标签到图像映射"
+        disable_tqdm_preproc = (self.rank != 0 and self.world_size > 1) # 只在rank 0显示tqdm (如果是多卡)
+        
+        for img_path in tqdm(all_image_paths, desc=prog_desc, disable=disable_tqdm_preproc):
+            base_filename, _ = os.path.splitext(img_path)
+            txt_path = base_filename + ".txt"
+            if os.path.exists(txt_path):
+                img_path_to_txt_path[img_path] = txt_path 
+                valid_image_paths_count +=1
+                try:
+                    with open(txt_path, 'r', encoding='utf-8') as f_txt:
+                        tags_str = f_txt.read().strip()
+                    current_img_tags_in_file = set(tags_str.split(self.config.TAG_SEPARATOR_IN_TXT))
+                    current_img_tags_in_file = {tag for tag in current_img_tags_in_file if tag}
+                    for tag_name in current_img_tags_in_file:
+                        if tag_name in self.tag_to_idx:
+                            tag_idx = self.tag_to_idx[tag_name]
+                            tag_idx_to_img_paths[tag_idx].append(img_path)
+                except Exception as e:
+                    if self.rank == 0: logger.warning(f"读取标签文件 {txt_path} 出错: {e}")
+        
+        if valid_image_paths_count == 0 and self.rank == 0 :
+             logger.error("在构建标签映射时，没有找到任何带有对应txt文件的有效图像。")
+             return {}, {}
+             
+        return tag_idx_to_img_paths, img_path_to_txt_path
+
+    def _apply_balanced_sampling(self, tag_idx_to_img_paths, img_path_to_txt_path_map):
+        """为训练集应用平衡采样策略。所有 rank 执行相同的逻辑以保证 self.file_pairs 一致。"""
+        seeded_random = random.Random(BALANCED_SAMPLING_SEED) # 每个rank使用相同的种子
+        
+        # 对每个类别的图像列表进行加籽随机打乱
+        # 注意：这里直接修改了传入的 tag_idx_to_img_paths 列表的内容顺序
+        for i in range(len(tag_idx_to_img_paths)):
+            seeded_random.shuffle(tag_idx_to_img_paths[i])
+
+        self.file_pairs = [] 
+        samples_added_for_class_count = [0] * self.config.NUM_CLASSES
+        next_sample_idx_for_class = [0] * self.config.NUM_CLASSES 
+
+        max_samples_per_class = MAX_SAMPLES_PER_CLASS_BALANCED_HARDCODED
+        target_total_train_size = TARGET_TRAIN_SET_SIZE_BALANCED_HARDCODED
+        
+        active_class_indices = [idx for idx, paths in enumerate(tag_idx_to_img_paths) if paths]
+        if not active_class_indices:
+            if self.rank == 0: logger.warning("平衡采样：没有找到任何带有有效标签的图像。训练集将为空。")
+            return
+
+        num_added_total = 0
+        safety_break_max_loops = (target_total_train_size * 2 if target_total_train_size > 0 else self.config.NUM_CLASSES * max_samples_per_class * 2)
+        if safety_break_max_loops <= 0 : 
+            safety_break_max_loops = len(img_path_to_txt_path_map) * 2 if img_path_to_txt_path_map else 100000 
+        
+        if self.rank == 0: logger.info(f"平衡采样启动：每类最多 {max_samples_per_class} 个样本，目标总大小: {'无限制' if target_total_train_size == -1 else target_total_train_size}")
+
+        loop_iteration = 0
+        while loop_iteration < safety_break_max_loops:
+            loop_iteration +=1
+            if target_total_train_size > 0 and num_added_total >= target_total_train_size:
+                if self.rank == 0: logger.info(f"已达到目标训练集大小: {num_added_total}")
+                break
+            
+            if not active_class_indices:
+                if self.rank == 0: logger.info("所有活动类别均已耗尽或达到采样上限。")
+                break
+
+            made_a_selection_this_round = False
+            seeded_random.shuffle(active_class_indices) # 确保类别选择顺序在各rank间一致
+
+            temp_active_classes_next_round = [] 
+
+            for class_idx in active_class_indices:
+                can_add_more_for_this_class = samples_added_for_class_count[class_idx] < max_samples_per_class
+                has_available_samples = next_sample_idx_for_class[class_idx] < len(tag_idx_to_img_paths[class_idx])
+
+                if can_add_more_for_this_class and has_available_samples:
+                    selected_img_path = tag_idx_to_img_paths[class_idx][next_sample_idx_for_class[class_idx]]
+                    txt_path = img_path_to_txt_path_map.get(selected_img_path)
+                    if txt_path:
+                        self.file_pairs.append((selected_img_path, txt_path))
+                        samples_added_for_class_count[class_idx] += 1
+                        next_sample_idx_for_class[class_idx] += 1
+                        num_added_total += 1
+                        made_a_selection_this_round = True
+                    
+                    if samples_added_for_class_count[class_idx] < max_samples_per_class and \
+                       next_sample_idx_for_class[class_idx] < len(tag_idx_to_img_paths[class_idx]):
+                        temp_active_classes_next_round.append(class_idx)
+                    
+                    if target_total_train_size > 0 and num_added_total >= target_total_train_size:
+                        break 
+                elif has_available_samples: 
+                    temp_active_classes_next_round.append(class_idx)
+            
+            active_class_indices = list(set(temp_active_classes_next_round)) 
+
+            if not made_a_selection_this_round and not active_class_indices : 
+                break
+            if not made_a_selection_this_round and active_class_indices: 
+                all_capped = True
+                for c_idx in active_class_indices:
+                    if samples_added_for_class_count[c_idx] < max_samples_per_class:
+                        all_capped = False
+                        break
+                if all_capped:
+                    if self.rank == 0: logger.info("所有剩余活跃类别均已达到其采样上限。")
+                    break
+        
+        if loop_iteration >= safety_break_max_loops and self.rank == 0:
+            logger.warning(f"平衡采样循环达到了最大启发式迭代次数 ({safety_break_max_loops})。当前训练集大小: {len(self.file_pairs)}")
+
+        seeded_random.shuffle(self.file_pairs) # 对最终选出的训练集样本进行一次整体的随机打乱
+        if self.rank == 0: logger.info(f"平衡采样完成。最终训练集大小: {len(self.file_pairs)}")
+
+
+    def _apply_standard_splitting(self, all_image_paths):
+        """应用标准的数据划分策略（分层或随机）。所有 rank 执行相同的逻辑。"""
+        X_filepaths_for_split = []
+        y_labels_list_for_split = [] 
+        all_valid_file_pairs_map_standard = {} 
+
+        use_stratified_split_config = getattr(self.config, 'ENABLE_STRATIFIED_SPLIT', True) 
+        use_stratified_split = use_stratified_split_config and SKMULTILEARN_AVAILABLE
+        
+        if self.rank == 0 and use_stratified_split_config and not SKMULTILEARN_AVAILABLE:
+            logger.warning("配置中 ENABLE_STRATIFIED_SPLIT=True，但 scikit-multilearn 不可用。将回退到随机划分。")
+        
+        temp_file_pairs_for_random_split = []
+        prog_desc_std = "预处理数据用于标准划分"
+        disable_tqdm_std = (self.rank != 0 and self.world_size > 1)
+
+        for img_path in tqdm(all_image_paths, desc=prog_desc_std, disable=disable_tqdm_std):
+            base_filename, _ = os.path.splitext(img_path)
+            txt_path = base_filename + ".txt"
+            if os.path.exists(txt_path):
+                all_valid_file_pairs_map_standard[img_path] = txt_path
+                if use_stratified_split and self.mode != "test": 
                     try:
-                        with open(txt_path, 'r', encoding='utf-8') as f:
-                            tags_str = f.read().strip()
+                        with open(txt_path, 'r', encoding='utf-8') as f_txt:
+                            tags_str = f_txt.read().strip()
                         current_img_tags = set(tags_str.split(self.config.TAG_SEPARATOR_IN_TXT))
                         current_img_tags = {tag for tag in current_img_tags if tag}
                         
-                        label_vector = torch.zeros(self.config.NUM_CLASSES, dtype=torch.int8) # 使用 int8 节省内存
-                        for tag in current_img_tags:
-                            if tag in self.tag_to_idx:
-                                label_vector[self.tag_to_idx[tag]] = 1
+                        label_vector = torch.zeros(self.config.NUM_CLASSES, dtype=torch.int8)
+                        if self.tag_to_idx and self.config.NUM_CLASSES > 0:
+                            for tag in current_img_tags:
+                                if tag in self.tag_to_idx:
+                                    label_vector[self.tag_to_idx[tag]] = 1
                         
-                        X_filepaths.append(img_path) # 只保留有对应txt文件的图像
-                        y_labels_list.append(label_vector.numpy()) # 转换为 NumPy array
+                        X_filepaths_for_split.append(img_path)
+                        y_labels_list_for_split.append(label_vector.numpy())
                     except Exception as e:
-                        if self.rank == 0: logger.warning(f"读取或处理标签文件 {txt_path} 出错: {e}，跳过图像 {img_path}")
-                # else:
-                    # if self.rank == 0: logger.debug(f"图像 {img_path} 的标签文件 {txt_path} 未找到，跳过。")
-            
-            if not X_filepaths:
-                if self.rank == 0: logger.error("没有找到任何有效的图像-标签对用于数据划分。")
-                self.current_mode_file_pairs = []
-                self.transform = self._get_transform()
-                return
-
-            y_labels_np = np.array(y_labels_list)
-            X_filepaths_np = np.array(X_filepaths) # 将文件路径也转为NumPy数组，方便索引
-
-            # 4. 数据划分
-            # 使用 IterativeStratification (如果可用) 或回退到随机划分
-            # train_ratio 通常是 0.8，val_ratio 是 0.2
-            # 注意: IterativeStratification 需要 X 和 y。X 可以是索引或实际数据。这里用索引。
-            # 我们需要的是文件对 (img_path, txt_path)，所以划分后要重新构建
-            
-            # IterativeStratification 的 train_test_split 行为是划分一次，所以我们需要 (1-val_ratio) 作为 test_size
-            # 例如，如果 val_ratio 是 0.2，那么 test_size 应该是 0.2，得到 80% 训练，20% 验证
-            # 如果配置文件中没有明确的验证集比例，我们默认使用 0.2
+                        if self.rank == 0: logger.warning(f"读取标签文件 {txt_path} 出错 (分层准备): {e}")
+                else: 
+                    temp_file_pairs_for_random_split.append((img_path, txt_path))
+        
+        y_labels_np = None 
+        if use_stratified_split and self.mode != "test":
+            if not X_filepaths_for_split:
+                if self.rank == 0: logger.error("分层划分：没有找到任何有效的图像-标签对。")
+                use_stratified_split = False 
+            else:
+                X_filepaths_np = np.array(X_filepaths_for_split)
+                y_labels_np = np.array(y_labels_list_for_split)
+        
+        if self.mode == "train" or self.mode == "val":
             val_split_ratio = getattr(self.config, 'VALIDATION_SPLIT_RATIO', 0.2)
             if not (0 < val_split_ratio < 1):
                 if self.rank == 0: logger.warning(f"无效的 VALIDATION_SPLIT_RATIO: {val_split_ratio}，将使用默认值 0.2")
                 val_split_ratio = 0.2
 
-            if SKMULTILEARN_AVAILABLE and y_labels_np.shape[0] > 1 and y_labels_np.shape[1] > 0: # 确保有数据和标签
+            train_img_paths, val_img_paths = [], []
+
+            if use_stratified_split and y_labels_np is not None and y_labels_np.shape[0] > 1 and y_labels_np.shape[1] > 0:
                 if self.rank == 0: logger.info(f"使用 IterativeStratification 进行数据划分，验证集比例: {val_split_ratio}")
-                # n_splits 通常是 2，但 IterativeStratification 的 k_fold 行为不同。
-                # 我们需要的是一个 train/test split。
-                # IterativeStratification 的 order 参数可以影响划分，通常默认为1或2。
-                # test_size 参数指定了第二个集合的大小。
-                stratifier = IterativeStratification(n_splits=2, order=1, sample_distribution_per_fold=[val_split_ratio, 1.0-val_split_ratio])
-                
-                # stratifier.split 返回的是 (train_indices, test_indices) 的生成器
-                # 由于 n_splits=2，它只会产生一对。
+                if y_labels_np.ndim == 1 and self.config.NUM_CLASSES == 1:
+                    y_labels_np = y_labels_np.reshape(-1, 1)
+                stratifier = IterativeStratification(n_splits=2, order=1, 
+                                                     sample_distribution_per_fold=[val_split_ratio, 1.0 - val_split_ratio])
                 try:
-                    train_indices, val_indices = next(stratifier.split(X_filepaths_np, y_labels_np))
-                except Exception as e: # IterativeStratification 可能因数据特性失败
-                    if self.rank == 0:
-                        logger.error(f"IterativeStratification 执行失败: {e}。将回退到随机划分。")
-                    # 回退到随机划分
-                    indices = np.arange(len(X_filepaths_np))
-                    # 使用固定的随机种子，确保所有进程的划分一致
-                    np.random.seed(42)
-                    np.random.shuffle(indices)
-                    split_point = int(len(indices) * (1.0 - val_split_ratio))
-                    train_indices = indices[:split_point]
-                    val_indices = indices[split_point:]
+                    val_indices_strat, train_indices_strat = next(stratifier.split(X_filepaths_np, y_labels_np))
+                    train_img_paths = X_filepaths_np[train_indices_strat].tolist()
+                    val_img_paths = X_filepaths_np[val_indices_strat].tolist()
+                    if self.rank == 0: logger.info(f"分层划分完成：训练集样本数 {len(train_img_paths)}, 验证集样本数 {len(val_img_paths)}")
+                except ValueError as e: 
+                    if self.rank == 0: logger.error(f"IterativeStratification 执行失败: {e}。将回退到随机划分。")
+                    use_stratified_split = False 
+            
+            if not use_stratified_split: 
+                if not temp_file_pairs_for_random_split: 
+                    for img_path_rand in all_image_paths: 
+                        txt_path_rand = all_valid_file_pairs_map_standard.get(img_path_rand)
+                        if txt_path_rand: temp_file_pairs_for_random_split.append((img_path_rand, txt_path_rand))
+                
+                if not temp_file_pairs_for_random_split:
+                     if self.rank == 0: logger.error("随机划分：没有有效的图像-标签对。")
+                     return # 如果没有数据，则 file_pairs 为空
 
-            else: # skmultilearn 不可用或数据不适合分层（例如只有一个样本或没有标签维度）
-                if self.rank == 0:
-                    if not SKMULTILEARN_AVAILABLE:
-                        logger.info(f"scikit-multilearn 不可用，回退到随机划分。验证集比例: {val_split_ratio}")
-                    else:
-                        logger.info(f"数据不适合 IterativeStratification (样本数: {y_labels_np.shape[0]}, 标签数: {y_labels_np.shape[1]})，回退到随机划分。验证集比例: {val_split_ratio}")
+                if self.rank == 0: logger.info(f"回退到随机划分。总有效样本数: {len(temp_file_pairs_for_random_split)}, 验证集比例: {val_split_ratio}")
+                seeded_random_split = random.Random(BALANCED_SAMPLING_SEED) # 使用一致的种子
+                seeded_random_split.shuffle(temp_file_pairs_for_random_split)
+                split_point = int(len(temp_file_pairs_for_random_split) * (1.0 - val_split_ratio))
+                train_pairs_random = temp_file_pairs_for_random_split[:split_point]
+                val_pairs_random = temp_file_pairs_for_random_split[split_point:]
+                train_img_paths = [p[0] for p in train_pairs_random]
+                val_img_paths = [p[0] for p in val_pairs_random]
 
-                indices = np.arange(len(X_filepaths_np))
-                np.random.seed(42) # 确保随机划分的一致性
-                np.random.shuffle(indices)
-                split_point = int(len(indices) * (1.0 - val_split_ratio))
-                train_indices = indices[:split_point]
-                val_indices = indices[split_point:]
+            selected_img_paths = train_img_paths if self.mode == "train" else val_img_paths
+            for img_path_sel in selected_img_paths:
+                txt_path_sel = all_valid_file_pairs_map_standard.get(img_path_sel)
+                if txt_path_sel: 
+                    self.file_pairs.append((img_path_sel, txt_path_sel))
 
-            if self.mode == "train":
-                selected_indices = train_indices
-            elif self.mode == "val":
-                selected_indices = val_indices
-            else: # "test" 模式不应该进入这个分支，但作为保险
-                selected_indices = np.arange(len(X_filepaths_np))
-
-            # 从选中的索引构建 self.current_mode_file_pairs
-            self.current_mode_file_pairs = []
-            for idx in selected_indices:
-                img_path = X_filepaths_np[idx]
-                base, _ = os.path.splitext(img_path)
-                txt_path = base + ".txt"
-                self.current_mode_file_pairs.append((img_path, txt_path))
-        
-        else: # self.mode == "test"
+        elif self.mode == "test":
             if self.rank == 0: logger.info("测试模式：使用所有找到的有效图像-标签对。")
-            self.current_mode_file_pairs = []
-            temp_progress_bar_test = tqdm(all_file_paths, desc="检查测试集文件", disable=(self.rank != 0))
-            for img_path in temp_progress_bar_test:
-                base_filename, _ = os.path.splitext(img_path)
-                txt_path = base_filename + ".txt"
-                if os.path.exists(txt_path): # 测试集也需要标签文件（即使只是用于格式一致性）
-                    self.current_mode_file_pairs.append((img_path, txt_path))
-            if not self.current_mode_file_pairs and self.rank == 0:
-                logger.warning("测试模式下未找到任何有效的图像-标签对。")
-
-
-        if self.rank == 0:
-            logger.info(f"模式: {self.mode}, 此模式下的样本数量 (划分后，被 DDP Sampler 处理前): {len(self.current_mode_file_pairs)}")
-            if self.mode != "test" and len(self.current_mode_file_pairs) == 0:
-                 logger.error(f"警告: 模式 '{self.mode}' 数据集为空，请检查数据源和划分逻辑！")
-
-
-        # 5. 定义图像变换
-        self.transform = self._get_transform()
+            for img_path_test in all_image_paths: 
+                txt_path_test = all_valid_file_pairs_map_standard.get(img_path_test)
+                if txt_path_test:
+                    self.file_pairs.append((img_path_test, txt_path_test))
+        else:
+            raise ValueError(f"不支持的模式: {self.mode}.")
 
     def _find_image_paths(self):
-        """扫描 IMAGE_DIR 目录，仅查找图像文件路径"""
         image_paths = []
         for ext in self.config.IMAGE_EXTENSIONS:
             image_paths.extend(glob.glob(os.path.join(self.image_dir, f"*{ext}")))
+        image_paths.sort() 
         return image_paths
 
     def _build_vocab_from_selected_tags(self):
-        """
-        从 selected_tags.csv 构建标签词汇表 (与原版逻辑相同)
-        """
         try:
             selected_tags_df = pd.read_csv(self.config.SELECTED_TAGS_CSV)
         except FileNotFoundError:
@@ -228,7 +331,7 @@ class DanbooruDataset(Dataset):
         
         if self.rank == 0: logger.info(f"从 selected_tags.csv 的 'name' 列初始加载 {len(current_tags_df['name'].unique())} 个唯一标签")
 
-        filter_threshold = getattr(self.config, 'FILTER_TAG_COUNT_THRESHOLD', 0) # 从配置获取阈值
+        filter_threshold = getattr(self.config, 'FILTER_TAG_COUNT_THRESHOLD', 0)
 
         if 'count' in selected_tags_df.columns and \
            filter_threshold is not None and \
@@ -247,18 +350,17 @@ class DanbooruDataset(Dataset):
             if self.rank == 0: logger.info(f"经过 'count' >= {filter_threshold} 过滤后，剩余 {len(final_tags_list)} 个唯一标签")
         else:
             final_tags_list = sorted(list(current_tags_df['name'].unique()))
-            if self.rank == 0: logger.info("未进行基于 'count' 列的过滤 (可能 'count' 列不存在，或阈值未设置/无效)")
+            if self.rank == 0: logger.info("未进行基于 'count' 列的过滤")
         
         tag_to_idx = {tag: idx for idx, tag in enumerate(final_tags_list)}
         
         if not final_tags_list and self.rank == 0:
-            logger.warning("警告: 处理 selected_tags.csv 后，词汇表为空，请检查文件内容和过滤条件")
+            logger.warning("警告: 处理 selected_tags.csv 后，词汇表为空")
 
         if self.rank == 0: logger.info(f"最终构建的词汇表包含 {len(final_tags_list)} 个标签")
         return final_tags_list, tag_to_idx
 
     def _get_transform(self):
-        """根据模式 (train/val/test) 获取图像变换 (与原版逻辑相同)"""
         img_size = getattr(self.config, 'IMAGE_SIZE', 224)
         norm_mean = getattr(self.config, 'NORM_MEAN', [0.485, 0.456, 0.406])
         norm_std = getattr(self.config, 'NORM_STD', [0.229, 0.224, 0.225])
@@ -280,15 +382,13 @@ class DanbooruDataset(Dataset):
             ])
 
     def __len__(self):
-        """返回数据集中样本的数量"""
-        return len(self.current_mode_file_pairs)
+        return len(self.file_pairs)
 
     def __getitem__(self, idx):
-        """获取指定索引的样本 (图像和对应的多标签向量)"""
-        if idx >= len(self.current_mode_file_pairs): # 索引越界检查
-            raise IndexError(f"索引 {idx} 超出数据集范围 {len(self.current_mode_file_pairs)}")
+        if idx >= len(self.file_pairs): 
+            raise IndexError(f"索引 {idx} 超出数据集范围 {len(self.file_pairs)}")
 
-        img_path, txt_path = self.current_mode_file_pairs[idx]
+        img_path, txt_path = self.file_pairs[idx]
         
         try:
             image = Image.open(img_path).convert("RGB")
@@ -307,16 +407,16 @@ class DanbooruDataset(Dataset):
             current_img_tags = set(tags_str.split(self.config.TAG_SEPARATOR_IN_TXT))
             current_img_tags = {tag for tag in current_img_tags if tag} 
         except FileNotFoundError:
-            # if self.rank == 0: logger.warning(f"警告: 标签文件 {txt_path} 未找到，该图像将没有标签")
-            current_img_tags = set() # 在 __init__ 中已经过滤了没有txt的图像，理论上不应发生
+            if self.rank == 0: logger.warning(f"警告: 标签文件 {txt_path} 在 __getitem__ 中未找到")
+            current_img_tags = set() 
         except Exception as e:
-            # if self.rank == 0: logger.error(f"读取或解析标签文件 {txt_path} 时出错: {e}，该图像将没有标签")
+            if self.rank == 0: logger.error(f"读取或解析标签文件 {txt_path} 时出错: {e}")
             current_img_tags = set()
         
-        target = torch.zeros(self.config.NUM_CLASSES, dtype=torch.float32) # 损失函数通常期望 float32
+        target = torch.zeros(self.config.NUM_CLASSES, dtype=torch.float32) 
         if not self.tag_to_idx and self.config.NUM_CLASSES > 0 : 
-             if self.rank == 0: logger.warning(f"图像 {img_path} 的标签处理跳过，因为 tag_to_idx 为空但 NUM_CLASSES 为 {self.config.NUM_CLASSES}")
-        elif self.tag_to_idx: 
+             if self.rank == 0: logger.warning(f"图像 {img_path} 的标签处理跳过，因为 tag_to_idx 为空")
+        elif self.tag_to_idx and self.config.NUM_CLASSES > 0: 
             for tag in current_img_tags:
                 if tag in self.tag_to_idx: 
                     target[self.tag_to_idx[tag]] = 1.0
@@ -324,54 +424,40 @@ class DanbooruDataset(Dataset):
         return image, target
 
 def get_dataloader(config, mode="train", tags_list=None, tag_to_idx=None, rank=0, world_size=1):
-    """
-    创建并返回 DataLoader (与原版多卡逻辑相同)
-    """
     dataset = DanbooruDataset(config, mode, tags_list, tag_to_idx, rank, world_size)
     
-    # 如果数据集为空 (例如，在划分后某个模式下没有样本了)
     if len(dataset) == 0:
         if rank == 0:
             logger.warning(f"模式 '{mode}' 的数据集为空，返回一个空的 DataLoader。")
-        # 返回一个可以迭代但实际上是空的 DataLoader，或者根据需要抛出错误
-        # 这里我们返回一个能处理空数据集的 DataLoader
-        # 注意：如果 batch_size > 0 而数据集为空，DataLoader 会在尝试获取第一个 batch 时出错
-        # 因此，如果数据集为空，我们可能需要特殊处理或确保调用者能处理这种情况
-        # 一个简单的方法是，如果数据集为空，则 batch_size 设为 1 (或任何正数)，但迭代器会立即结束
-        # 或者，如果确实不希望空的dataloader，这里可以 raise error
-        # return None, dataset.tags_list, dataset.tag_to_idx # 或者返回 None
-        # 为了能继续运行，我们还是创建一个 DataLoader，但它会是空的
-        # 如果 dataset 为空，DistributedSampler(dataset,...) 会出错，所以 sampler 设为 None
-        sampler = None
-        shuffle_in_loader = False # 空数据集不需要shuffle
-        actual_batch_size = config.BATCH_SIZE if config.BATCH_SIZE > 0 else 1
-    else:
-        final_tags_list = dataset.tags_list
-        final_tag_to_idx = dataset.tag_to_idx
+        return DataLoader(dataset, batch_size=max(1, config.BATCH_SIZE), shuffle=False, num_workers=0), dataset.tags_list, dataset.tag_to_idx
 
-        if config.NUM_CLASSES != len(final_tags_list):
-            if rank == 0: logger.info(f"DataLoader: 更新 config.NUM_CLASSES 从 {config.NUM_CLASSES} 到 {len(final_tags_list)}")
-            config.NUM_CLASSES = len(final_tags_list)
+    final_tags_list = dataset.tags_list
+    final_tag_to_idx = dataset.tag_to_idx
 
-        sampler = None
-        shuffle_in_loader = (mode == "train") 
+    if config.NUM_CLASSES != len(final_tags_list):
+        if rank == 0: logger.info(f"DataLoader: 更新 config.NUM_CLASSES 从 {config.NUM_CLASSES} 到 {len(final_tags_list)}")
+        config.NUM_CLASSES = len(final_tags_list)
 
-        if world_size > 1: 
-            drop_last_sampler = (mode == "train")
-            sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, 
-                                         shuffle=(mode == "train"), drop_last=drop_last_sampler)
-            shuffle_in_loader = False 
-        actual_batch_size = config.BATCH_SIZE
+    sampler = None
+    shuffle_in_loader = (mode == "train") 
 
+    if world_size > 1: 
+        drop_last_sampler = (mode == "train")
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, 
+                                     shuffle=(mode == "train"), drop_last=drop_last_sampler)
+        shuffle_in_loader = False 
+    
+    num_workers_val = max(0, os.cpu_count() // (2 * max(1,world_size)) if os.cpu_count() else 0)
 
     dataloader = DataLoader(
         dataset,
-        batch_size=max(1, actual_batch_size), # 确保 batch_size 至少为1
+        batch_size=max(1, config.BATCH_SIZE), 
         shuffle=shuffle_in_loader,
-        num_workers=max(0, os.cpu_count() // (2 * max(1,world_size)) if os.cpu_count() else 0),
-        pin_memory=True if config.DEVICE != "cpu" and isinstance(config.DEVICE, int) else False, # DEVICE可能是rank(int)或'cpu'
-        drop_last=(mode == "train" and len(dataset) > 0), # 只有在训练且数据集非空时才drop_last
+        num_workers=num_workers_val,
+        # 在多卡版本中，config.DEVICE 是 rank (int)
+        pin_memory=True if isinstance(config.DEVICE, int) else False, 
+        drop_last=(mode == "train" and len(dataset) > 0), 
         sampler=sampler
     )
     
-    return dataloader, dataset.tags_list, dataset.tag_to_idx
+    return dataloader, final_tags_list, final_tag_to_idx
