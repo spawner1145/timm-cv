@@ -51,7 +51,7 @@ danbooru_tagger/
    * 在项目根目录下创建 `data/images/` 文件夹
    * 将你所有的训练图片放入 `data/images/` 文件夹中
    * 对于每一张图片 (例如 `image1.jpg`)，在**相同目录下**创建一个同名的 `.txt` 文件 (例如 `image1.txt`)
-   * 在 `.txt` 文件中，写入该图片对应的 Danbooru 标签，标签之间用**,**分隔 (这个分隔符可以在 `base_config.py` 中的 `TAG_SEPARATOR_IN_TXT` 修改)
+   * 在 `.txt` 文件中，写入该图片对应的 Danbooru 标签，标签之间用`,`分隔 (这个分隔符可以在 `base_config.py` 中的 `TAG_SEPARATOR_IN_TXT` 修改)
      * 示例 `image1.txt` 内容: `1girl,solo,long_hair,red_eyes,school_uniform`
 2. **`selected_tags.csv` 文件:**
    * 在 `data/` 目录下创建一个名为 `selected_tags.csv` 的 CSV 文件
