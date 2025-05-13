@@ -1,4 +1,4 @@
-# timm库通用danbooru标签模型训练脚本
+# timm库通用danbooru标签模型训练脚本(多卡版)
 
 **项目结构**
 
@@ -102,6 +102,8 @@ pip install -r requirements.txt
          --config_name eva02_L_clip336_merged2b_config.py \
          --config_class_name Eva02LargeClip336Merged2BConfig \
          --run_name eva_test
+         # --gpu_ids "0,1" # 可选，指定使用的 GPU,多卡逗号隔开
+         # --dist_url "tcp://127.0.0.1:23456" # 可选，一般不用管，分布式有默认值
      ```
 
      * `--config_name`: 你在 `configs/` 目录下的配置文件名
