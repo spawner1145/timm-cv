@@ -10,6 +10,7 @@ import logging
 import random # 仍然保留 random 用于其他可能的随机操作或作为备选
 import numpy as np
 from sklearn.model_selection import train_test_split # 用于单标签或简单场景的备选
+import tqdm
 try:
     from skmultilearn.model_selection import IterativeStratification
     SKMULTILEARN_AVAILABLE = True
@@ -126,7 +127,7 @@ class DanbooruDataset(Dataset):
                 if self.rank == 0: logger.warning(f"无效的 VALIDATION_SPLIT_RATIO: {val_split_ratio}，将使用默认值 0.2")
                 val_split_ratio = 0.2
 
-            if SKMULTILLEARN_AVAILABLE and y_labels_np.shape[0] > 1 and y_labels_np.shape[1] > 0: # 确保有数据和标签
+            if SKMULTILEARN_AVAILABLE and y_labels_np.shape[0] > 1 and y_labels_np.shape[1] > 0: # 确保有数据和标签
                 if self.rank == 0: logger.info(f"使用 IterativeStratification 进行数据划分，验证集比例: {val_split_ratio}")
                 # n_splits 通常是 2，但 IterativeStratification 的 k_fold 行为不同。
                 # 我们需要的是一个 train/test split。
@@ -152,7 +153,7 @@ class DanbooruDataset(Dataset):
 
             else: # skmultilearn 不可用或数据不适合分层（例如只有一个样本或没有标签维度）
                 if self.rank == 0:
-                    if not SKMULTILLEARN_AVAILABLE:
+                    if not SKMULTILEARN_AVAILABLE:
                         logger.info(f"scikit-multilearn 不可用，回退到随机划分。验证集比例: {val_split_ratio}")
                     else:
                         logger.info(f"数据不适合 IterativeStratification (样本数: {y_labels_np.shape[0]}, 标签数: {y_labels_np.shape[1]})，回退到随机划分。验证集比例: {val_split_ratio}")
