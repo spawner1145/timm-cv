@@ -29,21 +29,11 @@ danbooru_tagger/
 
 **一、 环境设置**
 
-1. **创建虚拟环境 (推荐):**
+根目录运行：
 
-   ```
-   python -m venv .venv
-   # Linux/macOS:
-   source .venv/bin/activate
-   # Windows:
-   # .venv\Scripts\activate
-   ```
-2. **安装依赖:**
-   将前面提供的 `requirements.txt` 文件保存到项目根目录，然后运行：
-
-   ```
-   pip install -r requirements.txt
-   ```
+```
+pip install -r requirements.txt
+```
 
 **二、 数据准备(你可以直接运行data_prepare.py来从danbooru2024数据集获取)**
 
