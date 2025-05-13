@@ -8,6 +8,7 @@ from torchvision import transforms
 import logging
 import random # 用于随机划分的回退或测试模式
 import numpy as np
+import tqdm
 # 尝试导入 scikit-multilearn 用于分层划分
 try:
     from skmultilearn.model_selection import IterativeStratification
