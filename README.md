@@ -26,6 +26,15 @@ danbooru_tagger/
 └── requirements.txt              # Python 项目依赖  
 
 ```
+**前排提示**
+目前的代码默认是会用分层划分，对大数据集可能会要求极高的系统内存量，如果撑不住，用随机划分，去`src/dataset.py`找到开头的
+```
+try:
+    from skmultilearn.model_selection import IterativeStratification
+    SKMULTILEARN_AVAILABLE = True  # <--- 如果你把这里改成 False，就可以强制使用随机划分，大幅减少内存消耗
+except ImportError:
+    SKMULTILEARN_AVAILABLE = False
+```
 
 **一、 环境设置**
 
