@@ -10,7 +10,7 @@ import logging
 import random # 仍然保留 random 用于其他可能的随机操作或作为备选
 import numpy as np
 from sklearn.model_selection import train_test_split # 用于单标签或简单场景的备选
-import tqdm
+from tqdm import tqdm
 try:
     from skmultilearn.model_selection import IterativeStratification
     SKMULTILEARN_AVAILABLE = True
