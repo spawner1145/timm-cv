@@ -1,6 +1,5 @@
-# -*- coding: utf-8 -*-
 """
-通过fulldanbooru输出标签csv文件
+通过fulldanbooru2024数据集输出标签csv文件
 """
 import pyarrow.parquet as pq
 import pyarrow as pa
@@ -8,11 +7,9 @@ import pandas as pd
 import sys
 import os
 
-# --- 配置 ---
 parquet_file_path = 'metadata.parquet'
 csv_output_file = 'selected_tags.csv'
 
-# --- 映射关系 ---
 TAG_COLUMN_TO_CATEGORY = {
     'tag_string_general': 0,
     'tag_string_character': 4,
@@ -242,11 +239,10 @@ def main():
                         if process_rows_by_id_column_numeric_range(start_val, end_val, parquet_file, aggregated_data):
                             processed_successfully_in_iteration = True
                     except ValueError:
-                        # 解析为数字范围失败，则将整个输入视为单个ID (is_range_query 保持 False)
                         print(f"无法将 '{user_input}' 解析为数字范围，将尝试作为单个ID值进行精确匹配...")
                         pass 
 
-                if not is_range_query: # 如果不是范围查询，或范围解析失败
+                if not is_range_query:
                     if 'id' not in parquet_file.schema.names:
                         print(f"错误: 文件中没有 'id' 列, 无法按ID '{user_input}' 处理。")
                         continue
