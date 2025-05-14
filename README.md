@@ -47,7 +47,7 @@ pip install -r requirements.txt
 
 **二、 数据准备(你可以直接运行data_prepare.py来从danbooru2024数据集获取)**
 
-> 注意:如果你希望使用data_prepare.py，先去[danbooru2024数据集](https://huggingface.co/datasets/deepghs/danbooru2024-webp-4Mpixel)下载[metadata.parquet](https://huggingface.co/datasets/deepghs/danbooru2024-webp-4Mpixel/blob/main/metadata.parquet)并把它放到根目录
+> 注意:如果你希望使用data_prepare.py，先去[danbooru2024数据集](https://huggingface.co/datasets/deepghs/danbooru2024-webp-4Mpixel)下载[metadata.parquet](https://huggingface.co/datasets/deepghs/danbooru2024-webp-4Mpixel/blob/main/metadata.parquet)并把它放到根目录，获得数据集之后在data目录下找到selected_tags.csv，建议用filter_csv.py把它处理一遍，运行一下filter_top_n_per_category(input_file, 'cleaned_selected_tags.csv', min_count_value=200)或者类似的代码，生成新的csv来作为selected_tags.csv
 
 1. **图像和标签文件:(如果你用data_prepare.py，数据准备这些可以跳过了)**
    * 在项目根目录下创建 `data/images/` 文件夹
