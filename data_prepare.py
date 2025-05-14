@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-# downloader_and_processor.py
 """
 Danbooru2024图片下载、.txt标签生成与CSV聚合脚本,总之就是准备数据集用的脚本
 """
@@ -37,7 +36,7 @@ DOWNLOADER_SPECIFIC_COLS_TO_READ = [ID_COLUMN_NAME, TAG_COLUMN_FOR_TXT_CAPTIONS]
 ALL_REQUIRED_COLUMNS_IN_PARQUET = list(
     set(csv_aggregator.COLUMNS_TO_READ_ALWAYS + DOWNLOADER_SPECIFIC_COLS_TO_READ)
 )
-if ID_COLUMN_NAME not in ALL_REQUIRED_COLUMNS_IN_PARQUET: # 确保ID列一定在内
+if ID_COLUMN_NAME not in ALL_REQUIRED_COLUMNS_IN_PARQUET:
     ALL_REQUIRED_COLUMNS_IN_PARQUET.append(ID_COLUMN_NAME)
 
 
@@ -82,7 +81,7 @@ def fetch_data_and_prepare_for_processing(parquet_file_obj,
                 print(f"    输入的单个ID '{command_criteria}' 不是有效的整数。")
                 filtered_rows_df = pd.DataFrame()
         elif command_type == 'range_id':
-            start_val, end_val = command_criteria # 这些应该是数字（int或float）
+            start_val, end_val = command_criteria
             numeric_ids = pd.to_numeric(df_chunk_to_process[ID_COLUMN_NAME], errors='coerce')
             valid_mask = numeric_ids.notna()
             if not valid_mask.any(): filtered_rows_df = pd.DataFrame()
@@ -197,7 +196,6 @@ def download_images_and_write_captions(id_caption_list, img_dst_dir, pool_instan
 
 
 def main_downloader_and_processor():
-    print(f"--- Danbooru图片下载、.txt标签生成 与 CSV聚合脚本 ---")
     print(f"使用Parquet元数据: {PARQUET_FILE_PATH}")
     print(f"图片和.txt标签将保存到: {IMAGES_DST_DIR}")
     csv_output_dir_abs = os.path.abspath(os.path.dirname(CSV_OUTPUT_FILE) if os.path.dirname(CSV_OUTPUT_FILE) else ".")
@@ -225,7 +223,7 @@ def main_downloader_and_processor():
         id_arrow_type_str = str(id_arrow_field.type)
         print(f"  Parquet中 '{ID_COLUMN_NAME}' 列的Arrow数据类型: {id_arrow_type_str}")
         if not (pa.types.is_integer(id_arrow_field.type) or \
-                (pa.types.is_floating(id_arrow_field.type) and id_arrow_type_str.endswith('.0'))):
+                (pa.types.is_floating(id_arrow_field.type) and id_arrow_type_str.endswith('.0'))): # Check for float that are whole numbers
             print(f"  警告: '{ID_COLUMN_NAME}' 列的Arrow数据类型 ('{id_arrow_type_str}') 可能不完全是整数，但脚本会尝试按整数处理。")
 
 
@@ -270,7 +268,7 @@ def main_downloader_and_processor():
         command_type_for_fetch = None
         criteria_for_fetch = None
         apply_batch_csv_save_for_this_command = False
-        batch_save_interval = 20 
+        batch_save_interval = 20
 
         if user_input.lower() == 'all':
             command_type_for_fetch = 'all'
@@ -306,75 +304,57 @@ def main_downloader_and_processor():
                     print(f"输入 '{user_input}' 不是有效的 'all'、'整数-整数'范围或单个整数ID。请重试。")
                     continue
 
+        # 1. 从Parquet获取数据，聚合CSV数据到内存，并收集下载信息
         data_for_downloader = fetch_data_and_prepare_for_processing(
             parquet_file, command_type_for_fetch, criteria_for_fetch,
             save_csv_every_n_row_groups=batch_save_interval if apply_batch_csv_save_for_this_command else float('inf'),
             csv_output_filepath_for_batch_save=CSV_OUTPUT_FILE if apply_batch_csv_save_for_this_command else None
         )
+        
+        # 2. 在开始下载之前，保存当前聚合的CSV数据
+        if csv_aggregator.aggregated_data:
+            print(f"准备在下载操作前保存/更新聚合后的CSV数据到 '{CSV_OUTPUT_FILE}'...")
+            try:
+                csv_aggregator.save_aggregated_data_to_csv(csv_aggregator.aggregated_data, CSV_OUTPUT_FILE)
+                print(f"CSV数据已在下载前成功保存/更新。")
+            except Exception as e_csv_save:
+                print(f"错误: 在下载前保存CSV文件 '{CSV_OUTPUT_FILE}' 时发生错误: {e_csv_save}")
+        elif not os.path.exists(CSV_OUTPUT_FILE):
+            print(f"'{CSV_OUTPUT_FILE}' 不存在且当前无聚合数据，尝试创建空的CSV文件。")
+            try:
+                csv_output_dir_for_empty_file = os.path.dirname(CSV_OUTPUT_FILE)
+                if csv_output_dir_for_empty_file and not os.path.exists(csv_output_dir_for_empty_file):
+                     os.makedirs(csv_output_dir_for_empty_file, exist_ok=True)
+                pd.DataFrame(columns=['name', 'category', 'count']).to_csv(CSV_OUTPUT_FILE, index=False, encoding='utf-8')
+                print(f"已创建空的 '{CSV_OUTPUT_FILE}' 文件。")
+            except Exception as e_empty_csv:
+                print(f"错误: 尝试创建空的 '{CSV_OUTPUT_FILE}' 文件时出错: {e_empty_csv}")
 
+        # 3. 如果有数据需要下载，则执行下载和.txt生成
         if data_for_downloader:
             print(f"从元数据中获取了 {len(data_for_downloader)} 个项目用于下载和.txt文件生成。")
             download_images_and_write_captions(data_for_downloader, IMAGES_DST_DIR, pool)
         else:
-            print("根据您的输入，未能从元数据中找到任何有效的ID进行处理。")
+            print("未能从元数据中找到任何有效的ID进行处理。")
 
-        if csv_aggregator.aggregated_data:
-            if not (apply_batch_csv_save_for_this_command and data_for_downloader): 
-                try:
-                    print("正在保存/更新聚合后的CSV文件 ('selected_tags.csv')...")
-                    csv_aggregator.save_aggregated_data_to_csv(csv_aggregator.aggregated_data, CSV_OUTPUT_FILE)
-                except Exception as e_csv_save: print(f"保存CSV文件 '{CSV_OUTPUT_FILE}' 时出错: {e_csv_save}")
-        else:
-            print("(CSV聚合器中尚无数据)")
-
-    print("\n--- 脚本正在结束 ---")
     if csv_aggregator.aggregated_data:
         print("正在执行最终的CSV数据保存...")
         try:
             csv_aggregator.save_aggregated_data_to_csv(csv_aggregator.aggregated_data, CSV_OUTPUT_FILE)
+            print(f"最终CSV数据已成功保存到 '{CSV_OUTPUT_FILE}'。")
         except Exception as e_csv_save_final: print(f"最终保存CSV文件 '{CSV_OUTPUT_FILE}' 时出错: {e_csv_save_final}")
     else:
         print("在本次会话中，没有数据被聚合到CSV。")
         if not os.path.exists(CSV_OUTPUT_FILE):
             try:
+                csv_output_dir_for_final_empty = os.path.dirname(CSV_OUTPUT_FILE)
+                if csv_output_dir_for_final_empty and not os.path.exists(csv_output_dir_for_final_empty):
+                     os.makedirs(csv_output_dir_for_final_empty, exist_ok=True)
                 pd.DataFrame(columns=['name', 'category', 'count']).to_csv(CSV_OUTPUT_FILE, index=False, encoding='utf-8')
                 print(f"已创建空的 '{CSV_OUTPUT_FILE}' 文件。")
             except Exception as e_empty_csv: print(f"尝试创建空的 '{CSV_OUTPUT_FILE}' 文件时出错: {e_empty_csv}")
             
     print("\n脚本执行完毕。")
 
-if __name__ == '__main__':
-    if not os.path.exists(PARQUET_FILE_PATH):
-        print(f"'{PARQUET_FILE_PATH}' 未找到。将创建一个包含必需列的虚拟文件用于测试...")
-        dummy_ids_list = [12345, 67890, 11223, 33445, 55667, 77889, 99001, 24680, 13579, 54321, 
-                         2000, 3000, 4000, 5000, 80000, 80000]
-        num_dummy_rows = len(dummy_ids_list)
-        dummy_data_payload = {
-            ID_COLUMN_NAME: dummy_ids_list,
-            TAG_COLUMN_FOR_TXT_CAPTIONS: [f"示例标签A_{i} 示例标签B_{i} id_is_{dummy_ids_list[i]}" for i in range(num_dummy_rows)],
-            'tag_string_general': [f"通用标签_{i} 另一个_{i}" if i%2==0 else None for i in range(num_dummy_rows)],
-            'tag_string_character': [f"角色标签_{i}" for i in range(num_dummy_rows)],
-            'tag_string_copyright': [f"版权标签_{i}" if i%3!=0 else None for i in range(num_dummy_rows)],
-            'tag_string_artist': [f"作者标签_{i}" for i in range(num_dummy_rows)],
-            'tag_string_meta': [f"元数据标签_{i}" if i%4==0 else None for i in range(num_dummy_rows)],
-            'rating': ['g', 's', 'q', 'e', 'g'] * (num_dummy_rows // 5 + 1) [:num_dummy_rows]
-        }
-        df_for_parquet = pd.DataFrame(dummy_data_payload)
-        df_for_parquet[ID_COLUMN_NAME] = df_for_parquet[ID_COLUMN_NAME].astype(int)
-        df_for_parquet[TAG_COLUMN_FOR_TXT_CAPTIONS] = df_for_parquet[TAG_COLUMN_FOR_TXT_CAPTIONS].astype(pd.StringDtype())
-        for col_name_key in csv_aggregator.TAG_COLUMN_TO_CATEGORY.keys():
-            if col_name_key in df_for_parquet.columns:
-                df_for_parquet[col_name_key] = df_for_parquet[col_name_key].astype(pd.StringDtype())
-        if 'rating' in df_for_parquet.columns:
-            df_for_parquet['rating'] = df_for_parquet['rating'].astype(pd.StringDtype())
-        try:
-            arrow_table = pa.Table.from_pandas(df_for_parquet, preserve_index=False)
-            pq.write_table(arrow_table, PARQUET_FILE_PATH, row_group_size=5)
-            print(f"虚拟Parquet文件 '{PARQUET_FILE_PATH}' 已成功创建，包含 {len(df_for_parquet)} 行。")
-            print(f"测试建议: 输入 'all', 或范围如 '10000-70000', 或单个ID如 '{dummy_ids_list[0]}'.")
-            print("重要提示：下载功能需要有效的网络连接和真实存在的Danbooru图片ID。")
-        except Exception as e_create_parquet:
-            print(f"创建虚拟Parquet文件 '{PARQUET_FILE_PATH}' 时发生错误: {e_create_parquet}")
-            sys.exit(1)
-            
+if __name__ == '__main__':         
     main_downloader_and_processor()
