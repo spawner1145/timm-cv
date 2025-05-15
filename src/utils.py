@@ -17,9 +17,9 @@ def setup_logger(log_dir, run_name, log_level=logging.INFO, rank=0):
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
     
     if rank == 0: # 只有主进程 (rank 0) 设置文件和控制台处理器
-        file_handler = logging.FileHandler(os.path.join(log_dir, f"{run_name}.log"), mode='a', encoding='utf-8')
-        file_handler.setFormatter(formatter)
-        logger_instance.addHandler(file_handler)
+        #file_handler = logging.FileHandler(os.path.join(log_dir, f"{run_name}.log"), mode='a', encoding='utf-8')
+        #file_handler.setFormatter(formatter)
+        #logger_instance.addHandler(file_handler)
         
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
